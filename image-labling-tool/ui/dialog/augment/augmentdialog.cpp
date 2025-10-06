@@ -1,4 +1,5 @@
 #include "augmentdialog.h"
+#include "ui_augmentdialog.h"
 #include <QFileDialog>
 #include <QStandardPaths>
 #include "imagetiler.h"
@@ -11,11 +12,10 @@
 #include <algorithm>
 #include <QMessageBox>
 
-AugmentDialog::AugmentDialog(QWidget *parent, DataManager *dataSrc)
+AugmentDialog::AugmentDialog(QWidget *parent, DataSource *dataSrc)
     : QDialog(parent), _dataSrc(dataSrc), ui(new Ui::AugmentDialog)
 {
     ui->setupUi(this);
-
     ui->imageTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
     ui->imageTableWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
     ui->imageTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -34,13 +34,21 @@ AugmentDialog::AugmentDialog(QWidget *parent, DataManager *dataSrc)
             this, [=](const QString &text) {
                 ui->tileDimensionWidget->setVisible(text.contains("Tile"));
             });
+
+    connect(ui->fileNameFilterLineEdit, &QLineEdit::textChanged,
+            this, &AugmentDialog::applyFilter);
+
+    connect(ui->classFilterComboBox, &QComboBox::currentTextChanged,
+            this, &AugmentDialog::applyFilter);
+
+    connect(ui->augmentedOnlyCheckBox, &QCheckBox::toggled,
+            this, &AugmentDialog::applyFilter);
 }
 
 AugmentDialog::~AugmentDialog()
 {
     delete ui;
 }
-
 
 void AugmentDialog::openFileDialog()
 {
@@ -54,103 +62,134 @@ void AugmentDialog::openFileDialog()
     loadImageList(folder);
 }
 
+void AugmentDialog::on_closePushButton_clicked()
+{
+    qDebug() << "Cancel clicked!";
+    close();
+}
+
 void AugmentDialog::loadImageList(const QString &folder)
 {
-    if (folder.isEmpty()) return; // tránh clear bảng nếu folder rỗng
+    if (folder.isEmpty()) return;
 
     ui->imageFolderPathLineEdit->setText(folder);
-    ui->imageTableWidget->setRowCount(0);
 
     QDir dir(folder);
     QStringList filters = {"*.jpg", "*.jpeg", "*.png", "*.bmp"};
-    QFileInfoList fileList = dir.entryInfoList(filters, QDir::Files);
+    _allFiles = dir.entryInfoList(filters, QDir::Files);   //  lưu danh sách file gốc
 
-    for (int i = 0; i < fileList.size(); ++i) {
-        const QFileInfo &imgFile = fileList.at(i);
+    applyFilter(); // hiển thị theo filter hiện tại
+}
 
-        QString largestInfo = "0 x 0";
-        QString smallestInfo = "0 x 0";
+void AugmentDialog::applyFilter()
+{
+    ui->imageTableWidget->setRowCount(0);
 
+    QString nameFilter   = ui->fileNameFilterLineEdit->text().trimmed();
+    QString classFilter  = ui->classFilterComboBox->currentText();
+    bool showAugmented   = ui->augmentedOnlyCheckBox->isChecked();
+
+    for (const QFileInfo &imgFile : _allFiles) {
         QString baseName = imgFile.completeBaseName();
-        QString labelPath = dir.filePath(baseName + ".txt");
+        QString labelPath = imgFile.absolutePath() + "/" + baseName + ".txt";
 
-        QImage img(imgFile.absoluteFilePath());
-        int imgW = img.width();
-        int imgH = img.height();
+        // --- lọc theo tên ---
+        if (!nameFilter.isEmpty() && !imgFile.fileName().contains(nameFilter, Qt::CaseInsensitive))
+            continue;
 
-        // Chỉ xử lý khi ảnh load được và có label
-        if (!img.isNull() && QFile::exists(labelPath)) {
+        // --- lọc theo Labeled/Unlabeled ---
+        bool hasLabel = false;
+        if (QFile::exists(labelPath)) {
             QFile labelFile(labelPath);
-            if (labelFile.open(QIODevice::ReadOnly)) {
-                QTextStream in(&labelFile);
-                QList<BBox> boxes;
-
-                while (!in.atEnd()) {
-                    BBox b;
-
-                    // Đọc một dòng
-                    QString line = in.readLine().trimmed();
-                    if (line.isEmpty()) continue;
-
-                    QTextStream ls(&line, QIODevice::ReadOnly);
-                    ls >> b.cls >> b.xc >> b.yc >> b.w >> b.h;
-
-                    // Nếu không đọc đủ 5 giá trị thì bỏ qua
-                    if (ls.status() != QTextStream::Ok) continue;
-
-                    // Chỉ thêm box hợp lệ
-                    if (b.w > 0 && b.h > 0 && b.w <= 1 && b.h <= 1) {
-                        boxes.append(b);
-                    }
-                }
-
-                if (!boxes.isEmpty()) {
-                    auto largest = std::max_element(boxes.begin(), boxes.end(),
-                                                    [imgW, imgH](const BBox &a, const BBox &b) {
-                                                        return (a.w * imgW) * (a.h * imgH)
-                                                        < (b.w * imgW) * (b.h * imgH);
-                                                    });
-                    auto smallest = std::min_element(boxes.begin(), boxes.end(),
-                                                     [imgW, imgH](const BBox &a, const BBox &b) {
-                                                         return (a.w * imgW) * (a.h * imgH)
-                                                         < (b.w * imgW) * (b.h * imgH);
-                                                     });
-
-                    int lw = int(largest->w * imgW);
-                    int lh = int(largest->h * imgH);
-                    int sw = int(smallest->w * imgW);
-                    int sh = int(smallest->h * imgH);
-
-                    largestInfo = QString("%1 x %2").arg(lw).arg(lh);
-                    smallestInfo = QString("%1 x %2").arg(sw).arg(sh);
-                }
+            if (labelFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                hasLabel = !labelFile.readAll().trimmed().isEmpty(); // true nếu file có nội dung
             }
         }
 
-        ui->imageTableWidget->insertRow(i);
+        if (classFilter == "Labelled" && !hasLabel) continue;
+        if (classFilter == "Unlabelled" && hasLabel) continue;
 
-        QTableWidgetItem *item0 = new QTableWidgetItem(imgFile.fileName());
-        item0->setFlags(item0->flags() & ~Qt::ItemIsEditable);
-        item0->setData(Qt::UserRole, imgFile.absoluteFilePath());
-        ui->imageTableWidget->setItem(i, 0, item0);
+        // --- lọc Augmented Only ---
+        if (showAugmented) {
+            QRegularExpression rx("(_FH|_FV|_R90|_R-90|\\[\\d+\\])$");
+            if (rx.match(baseName).hasMatch()) continue;
+        }
 
-        QTableWidgetItem *item1 = new QTableWidgetItem(largestInfo);
-        item1->setFlags(item1->flags() & ~Qt::ItemIsEditable);
-        ui->imageTableWidget->setItem(i, 1, item1);
-
-        QTableWidgetItem *item2 = new QTableWidgetItem(smallestInfo);
-        item2->setFlags(item2->flags() & ~Qt::ItemIsEditable);
-        ui->imageTableWidget->setItem(i, 2, item2);
+        // thêm row
+        int row = ui->imageTableWidget->rowCount();
+        ui->imageTableWidget->insertRow(row);
+        addRowFromFile(imgFile, row);
     }
 
+    ui->countLabel->setText(QString("%1 images").arg(ui->imageTableWidget->rowCount()));
+
     ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);           // Image chiếm hết khoảng trống
-    ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents); // Largest Object vừa nội dung
-    ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents); // Smallest Object vừa nội dung
-    ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents); // Tile vừa nội dung
+    ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents); // Largest Object
+    ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents); // Smallest Object
+    ui->imageTableWidget->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents); // Tile
 
-    int total = ui->imageTableWidget->rowCount();
-    ui->countLabel->setText(QString("%1 images").arg(total));
+}
 
+void AugmentDialog::addRowFromFile(const QFileInfo &imgFile, int row)
+{
+    QString largestInfo = "0 x 0";
+    QString smallestInfo = "0 x 0";
+
+    QImage img(imgFile.absoluteFilePath());
+    QString labelPath = imgFile.absolutePath() + "/" + imgFile.completeBaseName() + ".txt";
+
+    if (!img.isNull() && QFile::exists(labelPath)) {
+        int imgW = img.width();
+        int imgH = img.height();
+
+        QFile labelFile(labelPath);
+        if (labelFile.open(QIODevice::ReadOnly)) {
+            QTextStream in(&labelFile);
+            QList<BBox> boxes;
+
+            while (!in.atEnd()) {
+                BBox b;
+                QString line = in.readLine().trimmed();
+                if (line.isEmpty()) continue;
+
+                QTextStream ls(&line, QIODevice::ReadOnly);
+                ls >> b.cls >> b.xc >> b.yc >> b.w >> b.h;
+                if (ls.status() != QTextStream::Ok) continue;
+
+                if (b.w > 0 && b.h > 0 && b.w <= 1 && b.h <= 1) {
+                    boxes.append(b);
+                }
+            }
+
+            if (!boxes.isEmpty()) {
+                auto largest = std::max_element(boxes.begin(), boxes.end(),
+                                                [imgW, imgH](const BBox &a, const BBox &b) {
+                                                    return (a.w * imgW) * (a.h * imgH) < (b.w * imgW) * (b.h * imgH);
+                                                });
+                auto smallest = std::min_element(boxes.begin(), boxes.end(),
+                                                 [imgW, imgH](const BBox &a, const BBox &b) {
+                                                     return (a.w * imgW) * (a.h * imgH) < (b.w * imgW) * (b.h * imgH);
+                                                 });
+
+                int lw = int(largest->w * imgW);
+                int lh = int(largest->h * imgH);
+                int sw = int(smallest->w * imgW);
+                int sh = int(smallest->h * imgH);
+
+                largestInfo = QString("%1 x %2").arg(lw).arg(lh);
+                smallestInfo = QString("%1 x %2").arg(sw).arg(sh);
+            }
+        }
+    }
+
+    // Thêm row vào bảng
+    QTableWidgetItem *item0 = new QTableWidgetItem(imgFile.fileName());
+    item0->setData(Qt::UserRole, imgFile.absoluteFilePath());
+    item0->setFlags(item0->flags() & ~Qt::ItemIsEditable);
+    ui->imageTableWidget->setItem(row, 0, item0);
+
+    ui->imageTableWidget->setItem(row, 1, new QTableWidgetItem(largestInfo));
+    ui->imageTableWidget->setItem(row, 2, new QTableWidgetItem(smallestInfo));
 }
 
 
@@ -337,12 +376,6 @@ void AugmentDialog::on_deletePushButton_clicked()
     }
 }
 
-void AugmentDialog::on_closePushButton_clicked()
-{
-    qDebug() << "Cancel clicked!";
-    close();
-}
-
 void AugmentDialog::updateSelectionCount()
 {
     int selected = ui->imageTableWidget->selectionModel()->selectedRows().count();
@@ -353,3 +386,4 @@ void AugmentDialog::updateSelectionCount()
     ui->deletePushButton->setText(
         QString("Delete (%1 selected)").arg(selected));
 }
+
